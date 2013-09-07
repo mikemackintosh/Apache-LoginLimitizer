@@ -1,4 +1,4 @@
-/*************************************************************************
+/*
    mod_llzr 0.1
    Copyright (C) 2013
 
@@ -19,7 +19,7 @@
 
    Instalation:
    - /usr/apache/bin/apxs -a -i -l cap -c mod_llzr.c
-*************************************************************************
+*/
 
 #include "httpd.h"
 #include "http_config.h"
@@ -60,6 +60,36 @@ typedef struct {
     int thread_num;
 } sb_handle;
 
+typedef struct {
+    const char* key;
+    const char* value;
+} keyValuePair;
+
+keyValuePair* readPost(request_rec* r) {
+    apr_array_header_t *pairs = NULL;
+    apr_off_t len;
+    apr_size_t size;
+    int res;
+    int i = 0;
+    char *buffer;
+    keyValuePair* kvp;
+
+    res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
+    if (res != OK || !pairs) return NULL; /* Return NULL if we failed or if there are is no POST data */
+    kvp = apr_pcalloc(r->pool, sizeof(keyValuePair) * (pairs->nelts + 1));
+    while (pairs && !apr_is_empty_array(pairs)) {
+        i++;
+        ap_form_pair_t *pair = (ap_form_pair_t *) apr_array_pop(pairs);
+        apr_brigade_length(pair->value, 1, &len);
+        size = (apr_size_t) len;
+        buffer = apr_palloc(r->pool, size + 1);
+        apr_brigade_flatten(pair->value, buffer, &size);
+        buffer[len] = 0;
+        kvp[i]->key = apr_pstrdup(r->pool, pair->name);
+        kvp[i]->value = buffer;
+    }
+    return kvp;
+}
 
 /* Create per-server configuration structure */
 static void *create_config(apr_pool_t *p, server_rec *s)
@@ -218,27 +248,65 @@ static int pre_connection(conn_rec *c)
 
     /* Count up the number of connections we are handling right now from this IP address */
     for (i = 0; i < server_limit; ++i) {
-	    for (j = 0; j < thread_limit; ++j) {
+	for (j = 0; j < thread_limit; ++j) {
     	    ws_record = ap_get_scoreboard_worker(i, j);
             switch (ws_record->status) {
-        	    case SERVER_BUSY_READ:
+        	case SERVER_BUSY_READ:
             	    if (strcmp(client_ip, ws_record->client) == 0)
-            		    ip_count++;
-                  break;
-              default:
+            		ip_count++;
+                    break;
+                default:
             	    break;
             }
-      }
+        }
     }
 
     if (ip_count > conf->limit) {
-	    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "Rejected, too many connections in READ state from %s", c->remote_ip);
-	    return OK;
+	   ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "Rejected, too many connections in READ state from %s", c->remote_ip);
+	return OK;
     } else {
-	    return DECLINED;
+	   return DECLINED;
     }
 }
 
+static int check_contents(request_rec *r)
+{
+    llzr_config *conf = ap_get_module_config (c->base_server->module_config,  &llzr_module);
+    keyValuePair* formData;
+    redis = conf->redisconn;
+    reply = conf->redisreply;
+
+    /*
+        Things of interest:
+
+        request_rec->uri
+        request_rec->useragent_ip
+        request_rec->request_time
+        request_rec->method
+
+    */
+
+   /*
+
+        @TODO: look through post request for username and password
+
+        if they are included, create a token id, and insert into redis database
+        send back a 402 payment required or 307 to /login/token
+        ask the user to authorize login...
+        on resubmission ony the token is passed and if exists, login is sucessful
+        if not, the entry is logged and evaluated
+
+   */
+
+    formData = readPost(r);
+    if (formData) {
+        int i;
+        for (i = 0; formData[i]; i++) {
+            ap_rprintf(r, "%s = %s\n", formData[i]->key, formData[i]->value);
+        }
+    }
+    return OK;
+}
 
 static void child_init (apr_pool_t *p, server_rec *s)
 {
@@ -251,6 +319,7 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_process_connection(pre_connection, NULL, NULL, APR_HOOK_FIRST);
     ap_hook_child_init(child_init, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_handler(check_contents, NULL, NULL, APR_HOOK_LAST);
 }
 
 module AP_MODULE_DECLARE_DATA llzr_module = {
