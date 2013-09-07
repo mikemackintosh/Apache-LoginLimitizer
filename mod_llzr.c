@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <glib.h>
+#include <openssl/sha.h>
 
 #include <hiredis.h>
 
@@ -55,40 +57,38 @@ typedef struct
     redisReply *redisreply;
 } llzr_config;
 
-typedef struct {
+typedef struct
+{
     int child_num;
     int thread_num;
 } sb_handle;
 
-typedef struct {
-    const char* key;
-    const char* value;
-} keyValuePair;
 
-keyValuePair* readPost(request_rec* r) {
+
+static llzr_conn* get_post_data(request_rec* r)
+{
+    GTable *request_post_data = g_hash_table_new(g_str_hash, g_str_equal);
     apr_array_header_t *pairs = NULL;
     apr_off_t len;
     apr_size_t size;
     int res;
-    int i = 0;
     char *buffer;
-    keyValuePair* kvp;
 
     res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
     if (res != OK || !pairs) return NULL; /* Return NULL if we failed or if there are is no POST data */
-    kvp = apr_pcalloc(r->pool, sizeof(keyValuePair) * (pairs->nelts + 1));
+
     while (pairs && !apr_is_empty_array(pairs)) {
-        i++;
         ap_form_pair_t *pair = (ap_form_pair_t *) apr_array_pop(pairs);
         apr_brigade_length(pair->value, 1, &len);
         size = (apr_size_t) len;
         buffer = apr_palloc(r->pool, size + 1);
         apr_brigade_flatten(pair->value, buffer, &size);
         buffer[len] = 0;
-        kvp[i]->key = apr_pstrdup(r->pool, pair->name);
-        kvp[i]->value = buffer;
+
+        g_hash_table_insert( request_post_data, apr_pstrdup(r->pool, pair->name), buffer);
     }
-    return kvp;
+
+    return request_post_data;
 }
 
 /* Create per-server configuration structure */
@@ -197,7 +197,7 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, serve
     const char *userdata_key = "llzr_init";
     llzr_config *conf = ap_get_module_config(parms->server->module_config, &llzr_module);
 
-    conf->redisconn = redisConnectWithTimeout(hostname, port, timeout);
+    conf->redisconn = redisConnect(conf->redis_host, conf->redis_port);
     if (conf->redisconn == NULL || conf->redisconn->err) {
         if (conf->redisconn) {
             ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "Redis error encountered %s", conf->redisconn->errstr);
@@ -269,10 +269,10 @@ static int pre_connection(conn_rec *c)
     }
 }
 
-static int check_contents(request_rec *r)
+static int check_contents(request_rec *req)
 {
     llzr_config *conf = ap_get_module_config (c->base_server->module_config,  &llzr_module);
-    keyValuePair* formData;
+    GTable *post_data = get_post_data(req);
     redis = conf->redisconn;
     reply = conf->redisreply;
 
@@ -283,8 +283,12 @@ static int check_contents(request_rec *r)
         request_rec->useragent_ip
         request_rec->request_time
         request_rec->method
-
     */
+
+    char *request_remote_ip         = recq->useragent_ip;
+    apr_time_t request_timestamp    = recq->request_time;
+    char *request_uri               = recq->uri;
+    char *request_method            = recq->method;
 
    /*
 
@@ -298,13 +302,26 @@ static int check_contents(request_rec *r)
 
    */
 
-    formData = readPost(r);
-    if (formData) {
-        int i;
-        for (i = 0; formData[i]; i++) {
-            ap_rprintf(r, "%s = %s\n", formData[i]->key, formData[i]->value);
-        }
+    /*
+    ...
+     */
+    if (post_data) {
+
+        /* ... hash the password to be secure in memory even.. */
+        size_t length = sizeof(post_data['USERNAME_FIELD']);
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        SHA1(post_data['USERNAME_FIELD'], length, hash);
+
+        reply = redisCommand(redis, "HMSET %s %s %s", request_remote_ip, username, hash);
+
     }
+    /*
+    ...
+     */
+
+    redisFreeReply(reply);
+    redisFree(redis);
+
     return OK;
 }
 
